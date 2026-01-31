@@ -15,6 +15,43 @@
       max-width: 640px;
     }
     .hud b{color:#fff;}
+
+    /* ===== OVERLAYS ===== */
+    .overlay{
+      position: fixed; inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      background: rgba(0,0,0,0.70);
+    }
+    .overlay .card{
+      background: rgba(10,10,10,0.85);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px;
+      padding: 18px 20px;
+      min-width: 320px;
+      text-align: center;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      color: #fff;
+    }
+    .overlay .title{
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+      margin-bottom: 12px;
+    }
+    .overlay button{
+      pointer-events: auto;
+      cursor: pointer;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 700;
+      background: #ffffff;
+      color: #111;
+    }
+    .overlay button:hover{ opacity: 0.92; }
   </style>
 </head>
 <body>
@@ -24,6 +61,22 @@
     <div><b>C</b> recentrar cámara</div>
     <div id="status">Cargando Game.glb...</div>
     <div id="debug"></div>
+  </div>
+
+  <!-- ===== WIN UI ===== -->
+  <div id="winOverlay" class="overlay">
+    <div class="card">
+      <div class="title">¡GANASTE! LOGRASTE ESCAPAR.</div>
+      <button id="retryBtnWin">Retry</button>
+    </div>
+  </div>
+
+  <!-- ===== LOSE UI ===== -->
+  <div id="loseOverlay" class="overlay">
+    <div class="card">
+      <div class="title">¡PERDISTE!</div>
+      <button id="retryBtnLose">Retry</button>
+    </div>
   </div>
 
   <script src="https://unpkg.com/three@0.134.0/build/three.min.js"></script>
@@ -47,17 +100,37 @@
     // ===== GAME STATE =====
     let seen = false;
 
+    // ===== WIN/LOSE STATE =====
+    let gameWon = false;
+    let gameLost = false;
+    const winOverlay = document.getElementById("winOverlay");
+    const loseOverlay = document.getElementById("loseOverlay");
+    document.getElementById("retryBtnWin").addEventListener("click", resetGame);
+    document.getElementById("retryBtnLose").addEventListener("click", resetGame);
+
+    // ===== TIMER (2 min) =====
+    const ROUND_TIME_MS = 60000;
+    let timeLeftMs = ROUND_TIME_MS;
+
+    function formatTime(ms){
+      ms = Math.max(0, ms);
+      const total = Math.ceil(ms / 1000);
+      const m = Math.floor(total / 60);
+      const s = total % 60;
+      return `${m}:${String(s).padStart(2,"0")}`;
+    }
+
     // ===== WAYPOINTS (WP_000..WP_012) =====
-    let waypoints = [];     // Array<THREE.Vector3> world positions
+    let waypoints = [];
     let wpIndex = 0;
-    const BOSS_SPEED = 1.4;     // velocidad patrulla
-    const WP_EPS = 0.25;        // distancia para "llegó"
+    const BOSS_SPEED = 1.4;
+    const WP_EPS = 0.25;
     const _bossToWP = new THREE.Vector3();
 
     // ===== COLISIONES (XZ) =====
     let PLAYER_RADIUS = 0.20;
     let BOSS_RADIUS   = 0.01;
-    let obstacles = []; // {name,minX,maxX,minZ,maxZ}
+    let obstacles = [];
 
     // ===== DEBUG VISUAL (cajas verdes) =====
     const SHOW_OBS_HELPERS = true;
@@ -81,9 +154,9 @@
     };
 
     // ===== MÁSCARAS (pickups) =====
-    let maskKitsune = null; // "kitsune"
-    let maskOni = null;     // "oni"
-    let maskChane = null;   // "chane"
+    let maskKitsune = null;
+    let maskOni = null;
+    let maskChane = null;
     const PICKUP_RADIUS = 0.35;
 
     const powers = {
@@ -121,34 +194,22 @@
         fragmentShader: `
           varying vec2 vUv;
           uniform float time;
-
           void main(){
             vec2 uv = vUv - 0.5;
-
-            // oval
             uv.x *= 0.6;
             float d = length(uv);
-
-            // borde animado
             float wave = sin(d * 20.0 - time * 4.0) * 0.03;
             float mask = smoothstep(0.45 + wave, 0.35, d);
-
-            vec3 col = mix(
-              vec3(0.1, 0.4, 1.0),
-              vec3(0.6, 0.9, 1.0),
-              1.0 - d * 2.0
-            );
-
+            vec3 col = mix(vec3(0.1, 0.4, 1.0), vec3(0.6, 0.9, 1.0), 1.0 - d * 2.0);
             gl_FragColor = vec4(col, mask);
           }
         `
       });
 
       portalMesh = new THREE.Mesh(geom, portalMat);
-      portalMesh.position.set(0, 0.8, 0); // cerca del suelo, visible
-      portalMesh.scale.set(1.5, 2, 1);  // oval vertical
-      portalMesh.rotation.y = Math.PI;    // orientación fija
-
+      portalMesh.position.set(-15, 0.8, -5); // <-- tu posición actual
+      portalMesh.scale.set(0.8, 2, 1);
+      portalMesh.rotation.y = Math.PI;
       scene.add(portalMesh);
     }
 
@@ -166,7 +227,7 @@
       return powers.kitsune && performance.now() < powers.invisUntil;
     }
 
-    // ===== NUEVO: búsqueda flexible de meshes por nombre =====
+    // ===== búsqueda flexible de meshes por nombre =====
     function findByNameLoose(rootObj, needle){
       const target = (needle || "").toLowerCase();
       let found = null;
@@ -178,7 +239,7 @@
       return found;
     }
 
-    // ===== NUEVO: radio de pickup basado en tamaño real del mesh =====
+    // ===== radio de pickup basado en tamaño real del mesh =====
     function getPickupRadiusFor(mesh){
       if (!mesh || !mesh.geometry) return PICKUP_RADIUS;
       const g = mesh.geometry;
@@ -188,7 +249,6 @@
       const s = new THREE.Vector3();
       mesh.getWorldScale(s);
       const worldR = r * Math.max(s.x, s.z);
-
       return Math.max(PICKUP_RADIUS, worldR * 0.8);
     }
 
@@ -198,8 +258,8 @@
     const _fovForward = new THREE.Vector3();
     function isPlayerInFOV(){
       if (isInvisible()) return false;
-
       if (!playerRig || !bossRig || !fovMesh) return false;
+
       const origin = fovMesh.position;
       playerRig.getWorldPosition(_playerPos);
 
@@ -218,7 +278,6 @@
       const half = THREE.Math.degToRad(FOV.angleDeg) / 2;
 
       if (isLineBlockedXZ(fovMesh.position, _playerPos)) return false;
-
       return angle <= half;
     }
 
@@ -267,14 +326,14 @@
       scene.add(spot);
       scene.add(spot.target);
 
-      // ===== Tone mapping (evita sobreexposición) =====
+      // ===== Tone mapping =====
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 0.8;
 
       scene.add(new THREE.GridHelper(80, 80, 0x666666, 0x333333));
       scene.add(new THREE.AxesHelper(3));
 
-      // ===== PORTAL (0,0,0) =====
+      // ===== PORTAL =====
       createPortal();
 
       controls = new THREE.OrbitControls(camera, renderer.domElement);
@@ -321,6 +380,82 @@
       animate();
     }
 
+    // ===== WIN/LOSE helpers =====
+    function hasAllMasks(){
+      return powers.kitsune && powers.oni && powers.chane;
+    }
+
+    function checkPortalWin(){
+      if (!portalMesh || !playerRig) return false;
+      if (!hasAllMasks()) return false;
+
+      const p = new THREE.Vector3();
+      const e = new THREE.Vector3();
+      playerRig.getWorldPosition(p);
+      portalMesh.getWorldPosition(e);
+
+      const dx = p.x - e.x;
+      const dz = p.z - e.z;
+
+      return (dx*dx + dz*dz) <= (0.9 * 0.9);
+    }
+
+    function winGame(){
+      gameWon = true;
+      winOverlay.style.display = "flex";
+    }
+
+    function loseGame(){
+      gameLost = true;
+      loseOverlay.style.display = "flex";
+    }
+
+    function resetGame(){
+      // UI
+      winOverlay.style.display = "none";
+      loseOverlay.style.display = "none";
+      gameWon = false;
+      gameLost = false;
+
+      // timer
+      timeLeftMs = ROUND_TIME_MS;
+
+      // states
+      seen = false;
+      powers.kitsune = false;
+      powers.oni = false;
+      powers.chane = false;
+      powers.invisUntil = 0;
+
+      FIRE.lastShot = 0;
+      BOSS.hp = 100;
+      BOSS.alive = true;
+
+      // masks back
+      if (maskKitsune) maskKitsune.visible = true;
+      if (maskOni) maskOni.visible = true;
+      if (maskChane) maskChane.visible = true;
+
+      // clear projectiles
+      for (let i = projectiles.length - 1; i >= 0; i--){
+        scene.remove(projectiles[i].mesh);
+        projectiles.splice(i,1);
+      }
+
+      // reset positions
+      if (playerRig) playerRig.position.set(10, 0, 0);
+      if (bossRig) bossRig.position.set(6, 0, 0);
+      wpIndex = 0;
+
+      // reset portal anim
+      if (portalMat) portalMat.uniforms.time.value = 0;
+
+      // reset fov opacity
+      if (fovMesh) fovMesh.material.opacity = FOV.opacity;
+
+      setStatus("Retry...");
+    }
+
     // ===== FOV helpers =====
     function findHeadBone(obj){
       let found = null;
@@ -355,7 +490,7 @@
 
       const mesh = new THREE.Mesh(geom, mat);
       mesh.rotation.order = "YXZ";
-      mesh.rotation.set(-Math.PI / 2, 0, 0); // plano XZ
+      mesh.rotation.set(-Math.PI / 2, 0, 0);
       scene.add(mesh);
       return mesh;
     }
@@ -580,7 +715,7 @@
       if (obstacles.length) resolveCircleVsAABB(bossRig.position, BOSS_RADIUS);
     }
 
-    // ===== MÁSCARAS (actualizado) =====
+    // ===== MÁSCARAS =====
     function updatePickups(){
       if (!playerRig) return;
 
@@ -678,11 +813,34 @@
       }
     }
 
+    // ===== ANIMS helpers (faltaban) =====
+    function fadeTo(current, next){
+      if (!next || current === next) return current;
+      if (current) current.fadeOut(0.15);
+      next.reset().fadeIn(0.15).play();
+      return next;
+    }
+
+    function playPlayer(name){
+      const next = playerAnims[name];
+      if (!next) return;
+      playerCurrent = fadeTo(playerCurrent, next);
+    }
+
+    function playBoss(name){
+      const next = bossAnims[name];
+      if (!next) return;
+      bossCurrent = fadeTo(bossCurrent, next);
+    }
+
+
+
     function updateHUD(){
       const maskCount = (powers.kitsune?1:0) + (powers.oni?1:0) + (powers.chane?1:0);
       const invis = isInvisible() ? ` | Invis ${(Math.max(0, (powers.invisUntil - performance.now())/1000)).toFixed(1)}s` : "";
       const boss = BOSS.alive ? ` | BossHP ${BOSS.hp}` : " | Boss OFF";
-      setDebug(`Máscaras ${maskCount}/3${invis}${boss}`);
+      const t = ` | Tiempo ${formatTime(timeLeftMs)}`;
+      setDebug(`Máscaras ${maskCount}/3${invis}${boss}${t}`);
     }
 
     // ===== LOAD GLB =====
@@ -709,7 +867,7 @@
         wpIndex = 0;
 
         setStatus(`✅ Cubos: ${obstacles.length} | Waypoints: ${waypoints.length}`);
-        setDebug(`Máscaras: kitsune=${!!maskKitsune} oni=${!!maskOni} chane=${!!maskChane}`);
+        setDebug(`Tiempo ${formatTime(timeLeftMs)}`);
 
         if (playerRig) playerRig.position.set(10, 0, 0);
         if (bossRig) bossRig.position.set(6, 0, 0);
@@ -750,45 +908,28 @@
       });
     }
 
-    // ===== ANIMS =====
-    function fadeTo(current, next){
-      if (!next || current === next) return current;
-      if (current) current.fadeOut(0.15);
-      next.reset().fadeIn(0.15).play();
-      return next;
-    }
-    function playPlayer(name){
-      const next = playerAnims[name];
-      if (!next) return;
-      playerCurrent = fadeTo(playerCurrent, next);
-    }
-    function playBoss(name){
-      const next = bossAnims[name];
-      if (!next) return;
-      bossCurrent = fadeTo(bossCurrent, next);
-    }
-
-    function clampTargetToPlayer(){
-      if (!playerRig) return;
-      const p = playerRig.position;
-      const desired = new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z);
-
-      const offset = controls.target.clone().sub(desired);
-      offset.y = 0;
-
-      const max = CAM.maxTargetOffset;
-      if (offset.length() > max) offset.setLength(max);
-
-      controls.target.set(desired.x + offset.x, desired.y, desired.z + offset.z);
-    }
-
     function update(dt){
+      // ===== Freeze si ganó o perdió =====
+      if (gameWon || gameLost) {
+        if (portalMat) portalMat.uniforms.time.value += dt;
+        if (portalMesh) portalMesh.lookAt(camera.position);
+        return;
+      }
+
+      // ===== TIMER =====
+      timeLeftMs -= (dt * 1000);
+      if (timeLeftMs <= 0) {
+        timeLeftMs = 0;
+        loseGame();
+        setStatus("¡PERDISTE!");
+        updateHUD();
+        return;
+      }
+
       if (playerMixer) playerMixer.update(dt);
       if (bossMixer) bossMixer.update(dt);
       if (portalMesh) portalMesh.lookAt(camera.position);
 
-
-      // ===== PORTAL anim =====
       if (portalMat) portalMat.uniforms.time.value += dt;
 
       if (extraKeys.e) { extraKeys.e = false; useKitsune(); }
@@ -840,6 +981,13 @@
 
       updateFOV();
 
+      // ===== WIN CHECK =====
+      if (checkPortalWin()) {
+        winGame();
+        setStatus("🏁 ¡GANASTE! LOGRASTE ESCAPAR.");
+        return;
+      }
+
       if (!seen && isPlayerInFOV()) {
         seen = true;
         setStatus("🚨 ¡TE VIO! (tocaste el FOV rojo)");
@@ -863,6 +1011,21 @@
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // ===== clampTargetToPlayer (se usa en update) =====
+    function clampTargetToPlayer(){
+      if (!playerRig) return;
+      const p = playerRig.position;
+      const desired = new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z);
+
+      const offset = controls.target.clone().sub(desired);
+      offset.y = 0;
+
+      const max = CAM.maxTargetOffset;
+      if (offset.length() > max) offset.setLength(max);
+
+      controls.target.set(desired.x + offset.x, desired.y, desired.z + offset.z);
     }
 
     init();
