@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Sigilo 3D - Game.glb</title>
+  <style>
+    body { margin:0; overflow:hidden; background:#111; font-family: Arial, sans-serif; }
+    canvas { display:block; width:100vw; height:100vh; }
+    .hud{
+      position:absolute; left:10px; top:10px; z-index:2;
+      color:#ddd; background:rgba(0,0,0,.45);
+      padding:10px 12px; border-radius:10px; font-size:14px;
+      pointer-events:none;
+      line-height: 1.35;
+      max-width: 640px;
+    }
+    .hud b{color:#fff;}
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div><b>WASD</b> mover</div>
+    <div><b>Mouse</b> rueda zoom · izq rotar · der pan</div>
+    <div><b>C</b> recentrar cámara</div>
+    <div id="status">Cargando Game.glb...</div>
+    <div id="debug"></div>
+  </div>
+
+  <script src="https://unpkg.com/three@0.134.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.134.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://unpkg.com/three@0.134.0/examples/js/controls/OrbitControls.js"></script>
+
+  <script>
+    let scene, camera, renderer, clock, controls;
+    let root, suelo, playerRig, bossRig;
+    let playerMixer, bossMixer;
+    let playerAnims = {}, bossAnims = {};
+    let playerCurrent = null, bossCurrent = null;
+
+    const statusEl = document.getElementById("status");
+    const debugEl  = document.getElementById("debug");
+    function setStatus(t){ statusEl.textContent = t; }
+    function setDebug(t){ debugEl.textContent = t; }
+
+    const keys = { w:false, a:false, s:false, d:false };
+
+    // ===== GAME STATE =====
+    let seen = false;
+
+    // ===== WAYPOINTS (WP_000..WP_012) =====
+    let waypoints = [];     // Array<THREE.Vector3> world positions
+    let wpIndex = 0;
+    const BOSS_SPEED = 1.4;     // velocidad patrulla
+    const WP_EPS = 0.25;        // distancia para "llegó"
+    const _bossToWP = new THREE.Vector3();
+
+    // ===== COLISIONES (XZ) =====
+    let PLAYER_RADIUS = 0.20;
+    let BOSS_RADIUS   = 0.01;
+    let obstacles = []; // {name,minX,maxX,minZ,maxZ}
+
+    // ===== DEBUG VISUAL (cajas verdes) =====
+    const SHOW_OBS_HELPERS = true;
+    const MAX_HELPERS = 36;
+    let obstacleHelpers = [];
+
+    // ===== AJUSTE DE BOXES (desde centro) =====
+    const BOX_SCALE = { x: 0.78, z: 1.00 };
+
+    // ===== FOV (visible) =====
+    let bossHeadBone = null;
+    let fovMesh = null;
+    const FOV = {
+      dist: 7.5,
+      angleDeg: 32,
+      y: 0.03,
+      color: 0xff4444,
+      opacity: 0.22,
+      opacitySeen: 0.48,
+      headYOffset: 1.6
+    };
+
+    // ===== MÁSCARAS (pickups) =====
+    let maskKitsune = null; // "kitsune"
+    let maskOni = null;     // "oni"
+    let maskChane = null;   // "chane"
+    const PICKUP_RADIUS = 0.35;
+
+    const powers = {
+      kitsune: false,
+      oni: false,
+      chane: false,
+      invisUntil: 0
+    };
+
+    const extraKeys = { e:false, space:false };
+
+    // fuego
+    const projectiles = [];
+    const FIRE = { speed: 9.0, life: 1.2, cooldownMs: 250, lastShot: 0 };
+    const BOSS = { hp: 100, alive: true };
+
+    // ===== PORTAL =====
+    let portalMesh = null;
+    let portalMat = null;
+
+    function createPortal(){
+      const geom = new THREE.PlaneGeometry(1, 1, 64, 64);
+
+      portalMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        uniforms: { time: { value: 0 } },
+        vertexShader: `
+          varying vec2 vUv;
+          void main(){
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec2 vUv;
+          uniform float time;
+
+          void main(){
+            vec2 uv = vUv - 0.5;
+
+            // oval
+            uv.x *= 0.6;
+            float d = length(uv);
+
+            // borde animado
+            float wave = sin(d * 20.0 - time * 4.0) * 0.03;
+            float mask = smoothstep(0.45 + wave, 0.35, d);
+
+            vec3 col = mix(
+              vec3(0.1, 0.4, 1.0),
+              vec3(0.6, 0.9, 1.0),
+              1.0 - d * 2.0
+            );
+
+            gl_FragColor = vec4(col, mask);
+          }
+        `
+      });
+
+      portalMesh = new THREE.Mesh(geom, portalMat);
+      portalMesh.position.set(0, 0.8, 0); // cerca del suelo, visible
+      portalMesh.scale.set(1.5, 2, 1);  // oval vertical
+      portalMesh.rotation.y = Math.PI;    // orientación fija
+
+      scene.add(portalMesh);
+    }
+
+    // ===== FOV yaw robusto (world) =====
+    const _tmp = new THREE.Vector3();
+    const _q = new THREE.Quaternion();
+    const _fwd = new THREE.Vector3(0, 0, 1);
+    function getBossYawWorld(obj){
+      obj.getWorldQuaternion(_q);
+      const v = _fwd.clone().applyQuaternion(_q);
+      return Math.atan2(v.x, v.z);
+    }
+
+    function isInvisible(){
+      return powers.kitsune && performance.now() < powers.invisUntil;
+    }
+
+    // ===== NUEVO: búsqueda flexible de meshes por nombre =====
+    function findByNameLoose(rootObj, needle){
+      const target = (needle || "").toLowerCase();
+      let found = null;
+      rootObj.traverse((o) => {
+        if (found || !o.name) return;
+        const n = o.name.toLowerCase();
+        if (n === target || n.includes(target)) found = o;
+      });
+      return found;
+    }
+
+    // ===== NUEVO: radio de pickup basado en tamaño real del mesh =====
+    function getPickupRadiusFor(mesh){
+      if (!mesh || !mesh.geometry) return PICKUP_RADIUS;
+      const g = mesh.geometry;
+      if (!g.boundingSphere) g.computeBoundingSphere();
+      const r = g.boundingSphere ? g.boundingSphere.radius : 0;
+
+      const s = new THREE.Vector3();
+      mesh.getWorldScale(s);
+      const worldR = r * Math.max(s.x, s.z);
+
+      return Math.max(PICKUP_RADIUS, worldR * 0.8);
+    }
+
+    // ===== DETECCIÓN (FOV rojo como verdad) =====
+    const _playerPos = new THREE.Vector3();
+    const _toPlayer = new THREE.Vector3();
+    const _fovForward = new THREE.Vector3();
+    function isPlayerInFOV(){
+      if (isInvisible()) return false;
+
+      if (!playerRig || !bossRig || !fovMesh) return false;
+      const origin = fovMesh.position;
+      playerRig.getWorldPosition(_playerPos);
+
+      _toPlayer.set(_playerPos.x - origin.x, 0, _playerPos.z - origin.z);
+      const dist = _toPlayer.length();
+      if (dist > FOV.dist) return false;
+      if (dist < 0.0001) return true;
+      _toPlayer.normalize();
+
+      _fovForward.set(1, 0, 0).applyQuaternion(fovMesh.quaternion);
+      _fovForward.y = 0;
+      _fovForward.normalize();
+
+      const dot = THREE.Math.clamp(_fovForward.dot(_toPlayer), -1, 1);
+      const angle = Math.acos(dot);
+      const half = THREE.Math.degToRad(FOV.angleDeg) / 2;
+
+      if (isLineBlockedXZ(fovMesh.position, _playerPos)) return false;
+
+      return angle <= half;
+    }
+
+    // ===== CÁMARA =====
+    const CAM = {
+      minDist: 6,
+      maxDist: 10,
+      minPolar: 0.30,
+      maxPolar: 0.60,
+      minAzimuth: -0.55,
+      maxAzimuth:  0.55,
+      maxTargetOffset: 1.5,
+      targetHeight: 0.2
+    };
+    let followPlayer = true;
+
+    function init(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111111);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 500);
+      camera.position.set(0, 12, 8);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x333333, 1.0);
+      hemi.position.set(0, 50, 0);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(15, 25, 10);
+      scene.add(dir);
+
+      // ===== Spot light principal =====
+      const spot = new THREE.SpotLight(0xffffff, 11.6);
+      spot.position.set(0, 5, 11);
+      spot.angle = Math.PI / 8;
+      spot.penumbra = 0.4;
+      spot.decay = 2;
+      spot.distance = 25;
+      spot.target.position.set(0, 0, 11);
+      scene.add(spot);
+      scene.add(spot.target);
+
+      // ===== Tone mapping (evita sobreexposición) =====
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.8;
+
+      scene.add(new THREE.GridHelper(80, 80, 0x666666, 0x333333));
+      scene.add(new THREE.AxesHelper(3));
+
+      // ===== PORTAL (0,0,0) =====
+      createPortal();
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.10;
+      controls.minDistance = CAM.minDist;
+      controls.maxDistance = CAM.maxDist;
+      controls.minPolarAngle = CAM.minPolar;
+      controls.maxPolarAngle = CAM.maxPolar;
+      controls.minAzimuthAngle = CAM.minAzimuth;
+      controls.maxAzimuthAngle = CAM.maxAzimuth;
+      controls.enablePan = true;
+      controls.screenSpacePanning = false;
+      controls.panSpeed = 0.7;
+
+      renderer.domElement.addEventListener("pointerdown", () => followPlayer = true);
+
+      window.addEventListener("keydown", (e) => {
+        const k = e.key.toLowerCase();
+
+        if (k === "c" && playerRig) {
+          const p = playerRig.position;
+          controls.target.set(p.x, p.y + CAM.targetHeight, p.z);
+          controls.update();
+        }
+
+        if (k === "e") extraKeys.e = true;
+        if (e.code === "Space") extraKeys.space = true;
+      });
+
+      window.addEventListener("keyup", (e) => {
+        const k = e.key.toLowerCase();
+        if (k === "e") extraKeys.e = false;
+        if (e.code === "Space") extraKeys.space = false;
+      });
+
+      clock = new THREE.Clock();
+
+      window.addEventListener("resize", onResize);
+      window.addEventListener("keydown", (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = true; });
+      window.addEventListener("keyup",   (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = false; });
+
+      loadGLB();
+      animate();
+    }
+
+    // ===== FOV helpers =====
+    function findHeadBone(obj){
+      let found = null;
+      obj.traverse((n) => {
+        if (found) return;
+        if (n && n.isBone && typeof n.name === "string") {
+          const s = n.name.toLowerCase();
+          if (s.includes("head") || s.includes("cabeza")) found = n;
+        }
+      });
+      return found;
+    }
+
+    function createFOVMesh(){
+      const r = FOV.dist;
+      const a = THREE.Math.degToRad(FOV.angleDeg);
+      const half = a / 2;
+
+      const shape = new THREE.Shape();
+      shape.moveTo(0, 0);
+      shape.absarc(0, 0, r, -half, +half, false);
+      shape.lineTo(0, 0);
+
+      const geom = new THREE.ShapeGeometry(shape, 32);
+      const mat = new THREE.MeshBasicMaterial({
+        color: FOV.color,
+        transparent: true,
+        opacity: FOV.opacity,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.rotation.order = "YXZ";
+      mesh.rotation.set(-Math.PI / 2, 0, 0); // plano XZ
+      scene.add(mesh);
+      return mesh;
+    }
+
+    function updateFOV(){
+      if (!bossRig || !fovMesh) return;
+
+      if (bossHeadBone) bossHeadBone.getWorldPosition(_tmp);
+      else {
+        bossRig.getWorldPosition(_tmp);
+        _tmp.y += FOV.headYOffset;
+      }
+
+      fovMesh.position.set(_tmp.x, FOV.y, _tmp.z);
+
+      const yaw = bossRig.rotation.y;
+      fovMesh.rotation.set(-Math.PI / 2, yaw - Math.PI/2, 0);
+    }
+
+    // ===== COLISIONES helpers =====
+    function isCubePrefix(name){
+      return typeof name === "string" && name.startsWith("Cube");
+    }
+
+    function resizeBoxFromCenter(box, scaleX, scaleZ){
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      const OFFSET_X = 0;
+      const OFFSET_Z = 0;
+      center.x += OFFSET_X;
+      center.z += OFFSET_Z;
+
+      size.x *= 1;
+      size.z *= 1;
+
+      box.min.set(center.x - size.x/2, box.min.y, center.z - size.z/2);
+      box.max.set(center.x + size.x/2, box.max.y, center.z + size.z/2);
+    }
+
+    function clearObstacleHelpers(){
+      for (const h of obstacleHelpers) scene.remove(h);
+      obstacleHelpers.length = 0;
+    }
+
+    function addBoxHelperFromObstacle(o, colorHex){
+      const box = new THREE.Box3(
+        new THREE.Vector3(o.minX, 0, o.minZ),
+        new THREE.Vector3(o.maxX, 0, o.maxZ)
+      );
+      box.min.y = 0;
+      box.max.y = 2.0;
+
+      const helper = new THREE.Box3Helper(box, colorHex);
+      obstacleHelpers.push(helper);
+      scene.add(helper);
+    }
+
+    function buildObstaclesFromCubes(rootObj){
+      const nodes = [];
+      const byUuid = new Set();
+
+      rootObj.updateMatrixWorld(true);
+
+      rootObj.traverse((o) => {
+        if (!o || !o.name || !isCubePrefix(o.name)) return;
+        if (byUuid.has(o.uuid)) return;
+        byUuid.add(o.uuid);
+        nodes.push(o);
+      });
+
+      for (let i = 0; i <= 35; i++){
+        const name = (i === 0) ? "Cube" : `Cube.${String(i).padStart(3,"0")}`;
+        const o = rootObj.getObjectByName(name);
+        if (!o) continue;
+        if (byUuid.has(o.uuid)) continue;
+        byUuid.add(o.uuid);
+        nodes.push(o);
+      }
+
+      const list = [];
+      const box = new THREE.Box3();
+
+      for (const o of nodes){
+        o.updateMatrixWorld(true);
+        box.setFromObject(o);
+        resizeBoxFromCenter(box, BOX_SCALE.x, BOX_SCALE.z);
+
+        list.push({
+          name: o.name,
+          minX: box.min.x, maxX: box.max.x,
+          minZ: box.min.z, maxZ: box.max.z
+        });
+      }
+
+      list.sort((a,b) => a.name.localeCompare(b.name));
+
+      if (SHOW_OBS_HELPERS) {
+        clearObstacleHelpers();
+        const n = Math.min(list.length, MAX_HELPERS);
+        for (let i = 0; i < n; i++){
+          addBoxHelperFromObstacle(list[i], 0x00ff00);
+        }
+      }
+
+      return list;
+    }
+
+    function resolveCircleVsAABB(pos, radius){
+      for (let iter = 0; iter < 3; iter++){
+        for (let i = 0; i < obstacles.length; i++){
+          const o = obstacles[i];
+
+          const cx = THREE.Math.clamp(pos.x, o.minX, o.maxX);
+          const cz = THREE.Math.clamp(pos.z, o.minZ, o.maxZ);
+
+          const dx = pos.x - cx;
+          const dz = pos.z - cz;
+          const d2 = dx*dx + dz*dz;
+
+          if (d2 > radius*radius) continue;
+
+          const left   = Math.abs(pos.x - o.minX);
+          const right  = Math.abs(o.maxX - pos.x);
+          const down   = Math.abs(pos.z - o.minZ);
+          const up     = Math.abs(o.maxZ - pos.z);
+
+          const m = Math.min(left, right, down, up);
+
+          if (m === left)       pos.x = o.minX - radius;
+          else if (m === right) pos.x = o.maxX + radius;
+          else if (m === down)  pos.z = o.minZ - radius;
+          else                  pos.z = o.maxZ + radius;
+        }
+      }
+    }
+
+    // ===== Line of sight (XZ): segmento vs AABB =====
+    function segmentIntersectsAABB2D(x0, z0, x1, z1, b){
+      let t0 = 0, t1 = 1;
+      const dx = x1 - x0;
+      const dz = z1 - z0;
+
+      function clip(p, q){
+        if (p === 0) return q >= 0;
+        const r = q / p;
+        if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+        else       { if (r < t0) return false; if (r < t1) t1 = r; }
+        return true;
+      }
+
+      if (!clip(-dx, x0 - b.minX)) return false;
+      if (!clip( dx, b.maxX - x0)) return false;
+      if (!clip(-dz, z0 - b.minZ)) return false;
+      if (!clip( dz, b.maxZ - z0)) return false;
+
+      return true;
+    }
+
+    function isLineBlockedXZ(from, to){
+      const x0 = from.x, z0 = from.z;
+      const x1 = to.x,   z1 = to.z;
+
+      for (let i = 0; i < obstacles.length; i++){
+        const b = obstacles[i];
+
+        const inside =
+          x0 >= b.minX && x0 <= b.maxX &&
+          z0 >= b.minZ && z0 <= b.maxZ;
+        if (inside) continue;
+
+        if (segmentIntersectsAABB2D(x0, z0, x1, z1, b)) return true;
+      }
+      return false;
+    }
+
+    // ===== WAYPOINTS helpers =====
+    function isWaypointName(name){
+      return typeof name === "string" && name.startsWith("WP_");
+    }
+
+    function collectWaypoints(rootObj){
+      const list = [];
+      rootObj.updateMatrixWorld(true);
+
+      rootObj.traverse((o) => {
+        if (!o || !isWaypointName(o.name)) return;
+        const p = new THREE.Vector3();
+        o.getWorldPosition(p);
+        list.push({ name: o.name, pos: p });
+      });
+
+      list.sort((a,b) => a.name.localeCompare(b.name));
+      return list.map(w => w.pos);
+    }
+
+    function updateBossPatrol(dt){
+      if (!bossRig || seen || !BOSS.alive) return;
+
+      if (!waypoints.length) {
+        bossRig.position.x += 1.4 * dt;
+        return;
+      }
+
+      const target = waypoints[wpIndex];
+      _bossToWP.set(target.x - bossRig.position.x, 0, target.z - bossRig.position.z);
+
+      const dist = _bossToWP.length();
+      if (dist < WP_EPS) {
+        wpIndex = (wpIndex + 1) % waypoints.length;
+        return;
+      }
+
+      _bossToWP.normalize();
+      bossRig.position.x += _bossToWP.x * BOSS_SPEED * dt;
+      bossRig.position.z += _bossToWP.z * BOSS_SPEED * dt;
+
+      bossRig.rotation.y = Math.atan2(_bossToWP.x, _bossToWP.z);
+
+      if (obstacles.length) resolveCircleVsAABB(bossRig.position, BOSS_RADIUS);
+    }
+
+    // ===== MÁSCARAS (actualizado) =====
+    function updatePickups(){
+      if (!playerRig) return;
+
+      const p = new THREE.Vector3();
+      playerRig.getWorldPosition(p);
+
+      function tryPick(mesh, keyName){
+        if (!mesh || !mesh.visible) return false;
+
+        const m = new THREE.Vector3();
+        mesh.getWorldPosition(m);
+
+        const dx = p.x - m.x;
+        const dz = p.z - m.z;
+
+        const r = getPickupRadiusFor(mesh);
+        const d2 = dx*dx + dz*dz;
+
+        if (d2 <= r*r) {
+          mesh.visible = false;
+          powers[keyName] = true;
+          return true;
+        }
+        return false;
+      }
+
+      let got = false;
+      got = tryPick(maskKitsune, "kitsune") || got;
+      got = tryPick(maskOni, "oni") || got;
+      got = tryPick(maskChane, "chane") || got;
+
+      if (got) setStatus("🎭 Máscara obtenida");
+    }
+
+    function useKitsune(){
+      if (!powers.kitsune) return;
+      powers.invisUntil = performance.now() + 5000;
+    }
+
+    function shootFireball(){
+      if (!powers.oni || !playerRig) return;
+
+      const now = performance.now();
+      if (now - FIRE.lastShot < FIRE.cooldownMs) return;
+      FIRE.lastShot = now;
+
+      const yaw = playerRig.rotation.y;
+      const dir = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw)).normalize();
+
+      const pos = new THREE.Vector3();
+      playerRig.getWorldPosition(pos);
+      pos.add(dir.clone().multiplyScalar(0.35));
+      pos.y = 0.15;
+
+      const geom = new THREE.SphereGeometry(0.06, 10, 10);
+      const mat  = new THREE.MeshStandardMaterial({ color: 0xff7a3d, emissive: 0x331000, emissiveIntensity: 0.6 });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.copy(pos);
+      scene.add(mesh);
+
+      projectiles.push({ mesh, vel: dir.multiplyScalar(FIRE.speed), life: FIRE.life });
+    }
+
+    function updateProjectiles(dt){
+      if (!projectiles.length) return;
+
+      for (let i = projectiles.length - 1; i >= 0; i--){
+        const pr = projectiles[i];
+        pr.life -= dt;
+        pr.mesh.position.x += pr.vel.x * dt;
+        pr.mesh.position.z += pr.vel.z * dt;
+
+        if (bossRig && BOSS.alive) {
+          const b = new THREE.Vector3();
+          bossRig.getWorldPosition(b);
+          const dx = pr.mesh.position.x - b.x;
+          const dz = pr.mesh.position.z - b.z;
+          if ((dx*dx + dz*dz) <= (0.35*0.35)) {
+            BOSS.hp -= 20;
+            scene.remove(pr.mesh);
+            projectiles.splice(i,1);
+
+            if (BOSS.hp <= 0) {
+              BOSS.alive = false;
+              setStatus("🔥 Vigilante derrotado");
+            }
+            continue;
+          }
+        }
+
+        if (pr.life <= 0) {
+          scene.remove(pr.mesh);
+          projectiles.splice(i,1);
+        }
+      }
+    }
+
+    function updateHUD(){
+      const maskCount = (powers.kitsune?1:0) + (powers.oni?1:0) + (powers.chane?1:0);
+      const invis = isInvisible() ? ` | Invis ${(Math.max(0, (powers.invisUntil - performance.now())/1000)).toFixed(1)}s` : "";
+      const boss = BOSS.alive ? ` | BossHP ${BOSS.hp}` : " | Boss OFF";
+      setDebug(`Máscaras ${maskCount}/3${invis}${boss}`);
+    }
+
+    // ===== LOAD GLB =====
+    function loadGLB(){
+      const loader = new THREE.GLTFLoader();
+      loader.load("Game.glb", (gltf) => {
+        setStatus("✅ GLB cargado. Buscando objetos...");
+
+        root = gltf.scene;
+        scene.add(root);
+
+        suelo = root.getObjectByName("Suelo");
+        playerRig = root.getObjectByName("Armature");
+        bossRig = root.getObjectByName("riggvigilante");
+
+        // máscaras (búsqueda flexible)
+        maskKitsune = findByNameLoose(root, "kitsune");
+        maskOni     = findByNameLoose(root, "oni");
+        maskChane   = findByNameLoose(root, "chane");
+
+        obstacles = buildObstaclesFromCubes(root);
+
+        waypoints = collectWaypoints(root);
+        wpIndex = 0;
+
+        setStatus(`✅ Cubos: ${obstacles.length} | Waypoints: ${waypoints.length}`);
+        setDebug(`Máscaras: kitsune=${!!maskKitsune} oni=${!!maskOni} chane=${!!maskChane}`);
+
+        if (playerRig) playerRig.position.set(10, 0, 0);
+        if (bossRig) bossRig.position.set(6, 0, 0);
+
+        if (playerRig) {
+          playerMixer = new THREE.AnimationMixer(playerRig);
+          gltf.animations.forEach((clip) => {
+            if (clip.name === "idle1" || clip.name === "run1") {
+              playerAnims[clip.name] = playerMixer.clipAction(clip);
+            }
+          });
+          playPlayer("idle1");
+        }
+
+        if (bossRig) {
+          bossMixer = new THREE.AnimationMixer(bossRig);
+          gltf.animations.forEach((clip) => {
+            if (clip.name === "idle2" || clip.name === "walk2") {
+              bossAnims[clip.name] = bossMixer.clipAction(clip);
+            }
+          });
+          playBoss(bossAnims["walk2"] ? "walk2" : "idle2");
+
+          bossHeadBone = findHeadBone(bossRig);
+          fovMesh = createFOVMesh();
+          updateFOV();
+        }
+
+        if (playerRig) {
+          const p = playerRig.position;
+          controls.target.set(p.x, p.y + CAM.targetHeight, p.z);
+          camera.position.set(p.x + 0.01, p.y + 12, p.z + 6);
+          controls.update();
+        }
+      }, undefined, (err) => {
+        console.error("Error cargando Game.glb:", err);
+        setStatus("❌ Error cargando Game.glb (mirá consola).");
+      });
+    }
+
+    // ===== ANIMS =====
+    function fadeTo(current, next){
+      if (!next || current === next) return current;
+      if (current) current.fadeOut(0.15);
+      next.reset().fadeIn(0.15).play();
+      return next;
+    }
+    function playPlayer(name){
+      const next = playerAnims[name];
+      if (!next) return;
+      playerCurrent = fadeTo(playerCurrent, next);
+    }
+    function playBoss(name){
+      const next = bossAnims[name];
+      if (!next) return;
+      bossCurrent = fadeTo(bossCurrent, next);
+    }
+
+    function clampTargetToPlayer(){
+      if (!playerRig) return;
+      const p = playerRig.position;
+      const desired = new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z);
+
+      const offset = controls.target.clone().sub(desired);
+      offset.y = 0;
+
+      const max = CAM.maxTargetOffset;
+      if (offset.length() > max) offset.setLength(max);
+
+      controls.target.set(desired.x + offset.x, desired.y, desired.z + offset.z);
+    }
+
+    function update(dt){
+      if (playerMixer) playerMixer.update(dt);
+      if (bossMixer) bossMixer.update(dt);
+      if (portalMesh) portalMesh.lookAt(camera.position);
+
+
+      // ===== PORTAL anim =====
+      if (portalMat) portalMat.uniforms.time.value += dt;
+
+      if (extraKeys.e) { extraKeys.e = false; useKitsune(); }
+      if (extraKeys.space) shootFireball();
+
+      // PLAYER
+      if (playerRig) {
+        const speedBase = 3.8;
+        const speed = powers.chane ? speedBase * 1.45 : speedBase;
+
+        let x = 0, z = 0;
+        if (keys.w) z -= 1;
+        if (keys.s) z += 1;
+        if (keys.a) x -= 1;
+        if (keys.d) x += 1;
+
+        const moving = (x !== 0 || z !== 0);
+
+        if (!seen && moving) {
+          const dir = new THREE.Vector3(x, 0, z).normalize();
+          playerRig.position.addScaledVector(dir, speed * dt);
+          playerRig.rotation.y = Math.atan2(dir.x, dir.z);
+          playPlayer(playerAnims["run1"] ? "run1" : "idle1");
+        } else {
+          playPlayer("idle1");
+        }
+
+        if (obstacles.length) resolveCircleVsAABB(playerRig.position, PLAYER_RADIUS);
+
+        if (followPlayer) {
+          const p = playerRig.position;
+          controls.target.lerp(new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z), 0.18);
+        }
+        clampTargetToPlayer();
+      }
+
+      updatePickups();
+      updateProjectiles(dt);
+
+      // BOSS patrulla
+      if (bossRig) {
+        const before = bossRig.position.clone();
+        updateBossPatrol(dt);
+
+        const moved = before.distanceTo(bossRig.position) > 0.0005;
+        if (moved && bossAnims["walk2"]) playBoss("walk2");
+        else if (!moved && bossAnims["idle2"]) playBoss("idle2");
+      }
+
+      updateFOV();
+
+      if (!seen && isPlayerInFOV()) {
+        seen = true;
+        setStatus("🚨 ¡TE VIO! (tocaste el FOV rojo)");
+        if (fovMesh) fovMesh.material.opacity = FOV.opacitySeen;
+      } else if (!seen) {
+        if (fovMesh) fovMesh.material.opacity = FOV.opacity;
+      }
+
+      updateHUD();
+    }
+
+    function animate(){
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.033);
+      update(dt);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    function onResize(){
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    init();
+  </script>
+</body>
+</html>
