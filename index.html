@@ -6,6 +6,7 @@
   <style>
     body { margin:0; overflow:hidden; background:#111; font-family: Arial, sans-serif; }
     canvas { display:block; width:100vw; height:100vh; }
+
     .hud{
       position:absolute; left:10px; top:10px; z-index:2;
       color:#ddd; background:rgba(0,0,0,.45);
@@ -37,7 +38,7 @@
       text-shadow: 0 1px 0 rgba(0,0,0,0.8);
     }
 
-    /* ===== OVERLAYS ===== */
+    /* ===== OVERLAYS (WIN/LOSE) ===== */
     .overlay{
       position: fixed; inset: 0;
       display: none;
@@ -68,11 +69,89 @@
       border: 0;
       border-radius: 10px;
       padding: 10px 14px;
-      font-weight: 700;
+      font-weight: 800;
       background: #ffffff;
       color: #111;
     }
     .overlay button:hover{ opacity: 0.92; }
+
+    /* ===== MAIN MENU / HOW TO PLAY ===== */
+    .menuOverlay{
+      position: fixed; inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      background: rgba(0,0,0,0.72);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      color:#fff;
+      font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, Monaco, "Courier New", monospace;
+    }
+    .menuCard{
+      width: min(900px, 92vw);
+      min-height: 420px;
+      padding: 28px 24px;
+      border-radius: 16px;
+      background: rgba(8,8,8,0.78);
+      border: 1px solid rgba(255,255,255,0.12);
+      box-shadow: 0 16px 60px rgba(0,0,0,0.65);
+    }
+    .menuTitle{
+      font-size: 38px;
+      font-weight: 900;
+      letter-spacing: 2px;
+      margin: 0 0 10px 0;
+      text-align:center;
+      text-transform: uppercase;
+    }
+    .menuSub{
+      opacity: 0.85;
+      text-align:center;
+      margin-bottom: 18px;
+      font-size: 14px;
+    }
+    .menuBtns{
+      display:flex;
+      gap: 12px;
+      justify-content:center;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+    .menuBtn{
+      pointer-events: auto;
+      cursor: pointer;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.06);
+      color:#fff;
+      border-radius: 12px;
+      padding: 12px 18px;
+      font-weight: 900;
+      letter-spacing: 1px;
+      min-width: 200px;
+    }
+    .menuBtn:hover{ background: rgba(255,255,255,0.10); }
+    .menuBtnPrimary{
+      background: rgba(255,255,255,0.92);
+      color:#111;
+      border-color: transparent;
+    }
+    .menuBtnPrimary:hover{ opacity: 0.95; background: rgba(255,255,255,0.92); }
+
+    .howList{
+      margin: 18px auto 0 auto;
+      width: min(680px, 94%);
+      font-size: 16px;
+      line-height: 1.7;
+      opacity: 0.95;
+    }
+    .howList li{ margin: 10px 0; }
+    .howHint{
+      margin-top: 18px;
+      text-align:center;
+      opacity: 0.75;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
@@ -86,6 +165,34 @@
 
   <!-- Dialogo (sobre la cabeza) -->
   <div id="speech" style="display:none"></div>
+
+  <!-- ===== MENU ===== -->
+  <div id="menuOverlay" class="menuOverlay">
+    <div class="menuCard">
+      <div class="menuTitle">EL PORTADOR</div>
+      <div class="menuSub">PLAY to start · HOW TO PLAY to see controls</div>
+
+      <div id="menuMain">
+        <div class="menuBtns">
+          <button id="btnPlay" class="menuBtn menuBtnPrimary">PLAY</button>
+          <button id="btnHow" class="menuBtn">HOW TO PLAY</button>
+        </div>
+        <div class="howHint">Tip: after PLAY, click or press any key once to enable audio.</div>
+      </div>
+
+      <div id="menuHow" style="display:none">
+        <ul class="howList">
+          <li><b>WASD</b> to move</li>
+          <li><b>E</b> to become invisible (requires <b>Kitsune Mask</b>)</li>
+          <li><b>SPACE</b> to throw fireballs (requires <b>Oni Mask</b>)</li>
+        </ul>
+        <div class="menuBtns" style="margin-top:22px">
+          <button id="btnBack" class="menuBtn">BACK</button>
+          <button id="btnPlay2" class="menuBtn menuBtnPrimary">PLAY</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- ===== WIN UI ===== -->
   <div id="winOverlay" class="overlay">
@@ -107,7 +214,6 @@
   <script src="./libs/GLTFLoader.js"></script>
   <script src="./libs/OrbitControls.js"></script>
 
-
   <script>
     let scene, camera, renderer, clock, controls;
     let root, suelo, playerRig, bossRig;
@@ -122,8 +228,39 @@
 
     const keys = { w:false, a:false, s:false, d:false };
 
+    // ===== MENU STATE =====
+    const menuOverlay = document.getElementById("menuOverlay");
+    const menuMain = document.getElementById("menuMain");
+    const menuHow  = document.getElementById("menuHow");
+    const btnPlay  = document.getElementById("btnPlay");
+    const btnPlay2 = document.getElementById("btnPlay2");
+    const btnHow   = document.getElementById("btnHow");
+    const btnBack  = document.getElementById("btnBack");
+
+    let gameStarted = false;
+
+    function showMenu(){
+      menuOverlay.style.display = "flex";
+      menuMain.style.display = "block";
+      menuHow.style.display = "none";
+    }
+    function showHow(){
+      menuMain.style.display = "none";
+      menuHow.style.display = "block";
+    }
+    function startGame(){
+      if (gameStarted) return;
+      gameStarted = true;
+      menuOverlay.style.display = "none";
+      setStatus("🕹️ ¡Jugá! Conseguí las 3 máscaras y escapá por el portal.");
+    }
+
+    btnPlay.addEventListener("click", startGame);
+    btnPlay2.addEventListener("click", startGame);
+    btnHow.addEventListener("click", showHow);
+    btnBack.addEventListener("click", showMenu);
+
     // ===== AUDIO AMBIENTE (EN ORDEN) + CROSSFADE (FADE IN/OUT) =====
-    // Patch: timers por-audio (para que fade in/out no se pisen) + scheduling robusto + archivos en MAYÚSCULAS
     let ambA = null, ambB = null;
     let ambActive = null;      // el que suena ahora
     let ambInactive = null;    // el que se prepara para el próximo
@@ -137,7 +274,6 @@
 
     let trackIndex = 0;
 
-    // Ajustes
     const FADE_IN_S    = 1.20;
     const FADE_OUT_S   = 1.20;
     const XFADE_S      = 1.20;
@@ -638,6 +774,10 @@
       if (fovMesh) fovMesh.material.opacity = FOV.opacity;
 
       setStatus("Retry...");
+
+      // al apretar retry, reanuda el juego directo
+      gameStarted = true;
+      menuOverlay.style.display = "none";
 
       // audio
       resumeAudio();
@@ -1144,13 +1284,16 @@
       // AUDIO init
       initAudio();
 
+      // mostrar menú al inicio
+      showMenu();
+
       renderer.domElement.addEventListener("pointerdown", () => {
         followPlayer = true;
-        startAudioOnce();
+        if (gameStarted) startAudioOnce();
       });
 
       window.addEventListener("keydown", (e) => {
-        startAudioOnce();
+        if (gameStarted) startAudioOnce();
 
         const k = e.key.toLowerCase();
 
@@ -1186,6 +1329,14 @@
       if (gameWon || gameLost) {
         if (portalMat) portalMat.uniforms.time.value += dt;
         if (portalMesh) portalMesh.lookAt(camera.position);
+        return;
+      }
+
+      // freeze si el juego no empezó (menú)
+      if (!gameStarted) {
+        if (portalMat) portalMat.uniforms.time.value += dt;
+        if (portalMesh) portalMesh.lookAt(camera.position);
+        updateSpeech();
         return;
       }
 
@@ -1257,11 +1408,13 @@
         return;
       }
 
-      // lose by detection
+      // lose by detection (muestra PERDISTE)
       if (!seen && isPlayerInFOV()) {
         seen = true;
         setStatus("🚨 ¡TE VIO! (tocaste el FOV rojo)");
         if (fovMesh) fovMesh.material.opacity = FOV.opacitySeen;
+        loseGame();
+        return;
       } else if (!seen) {
         if (fovMesh) fovMesh.material.opacity = FOV.opacity;
       }
