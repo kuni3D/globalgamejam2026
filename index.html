@@ -16,6 +16,27 @@
     }
     .hud b{color:#fff;}
 
+    /* ===== DIALOGO SOBRE LA CABEZA (terminal) ===== */
+    #speech{
+      position: fixed;
+      z-index: 9998;
+      pointer-events: none;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.70);
+      border: 1px solid rgba(255,255,255,0.18);
+      color: #fff;
+      font-size: 14px;
+      line-height: 1.2;
+      max-width: 340px;
+      transform: translate(-50%, -100%);
+      white-space: pre-wrap;
+
+      /* “terminal” sin descargar */
+      font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, Monaco, "Courier New", monospace;
+      text-shadow: 0 1px 0 rgba(0,0,0,0.8);
+    }
+
     /* ===== OVERLAYS ===== */
     .overlay{
       position: fixed; inset: 0;
@@ -63,6 +84,9 @@
     <div id="debug"></div>
   </div>
 
+  <!-- Dialogo (sobre la cabeza) -->
+  <div id="speech" style="display:none"></div>
+
   <!-- ===== WIN UI ===== -->
   <div id="winOverlay" class="overlay">
     <div class="card">
@@ -79,9 +103,10 @@
     </div>
   </div>
 
-  <script src="https://unpkg.com/three@0.134.0/build/three.min.js"></script>
-  <script src="https://unpkg.com/three@0.134.0/examples/js/loaders/GLTFLoader.js"></script>
-  <script src="https://unpkg.com/three@0.134.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="./libs/three.min.js"></script>
+  <script src="./libs/GLTFLoader.js"></script>
+  <script src="./libs/OrbitControls.js"></script>
+
 
   <script>
     let scene, camera, renderer, clock, controls;
@@ -97,6 +122,231 @@
 
     const keys = { w:false, a:false, s:false, d:false };
 
+    // ===== AUDIO AMBIENTE (EN ORDEN) + CROSSFADE (FADE IN/OUT) =====
+    // Patch: timers por-audio (para que fade in/out no se pisen) + scheduling robusto + archivos en MAYÚSCULAS
+    let ambA = null, ambB = null;
+    let ambActive = null;      // el que suena ahora
+    let ambInactive = null;    // el que se prepara para el próximo
+    let audioStarted = false;
+
+    const playlist = [
+      { src: "AMBIENTE1.mp3", vol: 1.00 },
+      { src: "AMBIENTE2.mp3", vol: 0.75 },
+      { src: "AMBIENTE3.mp3", vol: 0.50 },
+    ];
+
+    let trackIndex = 0;
+
+    // Ajustes
+    const FADE_IN_S    = 1.20;
+    const FADE_OUT_S   = 1.20;
+    const XFADE_S      = 1.20;
+    const FADE_STEP_MS = 30;
+
+    let nextXFadeTimeout = null;
+
+    function clearXFadeTimeout(){
+      if (nextXFadeTimeout) { clearTimeout(nextXFadeTimeout); nextXFadeTimeout = null; }
+    }
+
+    // ✅ timer por-audio (no global)
+    function clearAudioFadeTimer(audioEl){
+      if (!audioEl) return;
+      if (audioEl._fadeTimer) {
+        clearInterval(audioEl._fadeTimer);
+        audioEl._fadeTimer = null;
+      }
+    }
+
+    function initAudio(){
+      ambA = new Audio();
+      ambB = new Audio();
+
+      for (const a of [ambA, ambB]){
+        a.preload = "auto";
+        a.loop = false;
+        a._fadeTimer = null;
+      }
+
+      ambActive = ambA;
+      ambInactive = ambB;
+    }
+
+    function fadeAudioTo(audioEl, targetVol, seconds, onDone){
+      if (!audioEl) return;
+      clearAudioFadeTimer(audioEl);
+
+      const startVol = (typeof audioEl.volume === "number") ? audioEl.volume : 0;
+      const delta = targetVol - startVol;
+      const steps = Math.max(1, Math.floor((seconds * 1000) / FADE_STEP_MS));
+      let i = 0;
+
+      audioEl._fadeTimer = setInterval(() => {
+        i++;
+        const t = i / steps;
+        audioEl.volume = Math.max(0, Math.min(1, startVol + delta * t));
+
+        if (i >= steps){
+          clearAudioFadeTimer(audioEl);
+          audioEl.volume = Math.max(0, Math.min(1, targetVol));
+          if (onDone) onDone();
+        }
+      }, FADE_STEP_MS);
+    }
+
+    function scheduleNextCrossfade(){
+      if (!ambActive) return;
+
+      clearXFadeTimeout();
+
+      // Limpia handler viejo
+      ambActive.onended = null;
+
+      const arm = () => {
+        const dur = ambActive.duration;
+
+        if (!Number.isFinite(dur) || dur <= 0){
+          // Espera metadata de forma robusta
+          ambActive.onloadedmetadata = arm;
+          ambActive.ondurationchange = arm;
+          return;
+        }
+
+        // ya tenemos duración: armamos el crossfade
+        ambActive.onloadedmetadata = null;
+        ambActive.ondurationchange = null;
+
+        const ms = Math.max(0, (dur - XFADE_S) * 1000);
+
+        nextXFadeTimeout = setTimeout(() => {
+          if (!audioStarted) return;
+          if (!ambActive || ambActive.paused) return;
+
+          trackIndex = (trackIndex + 1) % playlist.length;
+          playTrack(trackIndex);
+        }, ms);
+      };
+
+      arm();
+
+      // Fallback final (si termina igual)
+      ambActive.onended = () => {
+        if (!audioStarted) return;
+        trackIndex = (trackIndex + 1) % playlist.length;
+        playTrack(trackIndex);
+      };
+    }
+
+    function playTrack(i){
+      if (!ambActive || !ambInactive) return;
+
+      const next = playlist[i];
+
+      // prepara el siguiente audio
+      ambInactive.src = next.src;
+      ambInactive.currentTime = 0;
+      ambInactive.volume = 0;
+
+      ambInactive.play().catch(()=>{});
+
+      // fades simultáneos sin pisarse
+      fadeAudioTo(ambInactive, next.vol, FADE_IN_S);
+
+      const prev = ambActive;
+      fadeAudioTo(prev, 0, FADE_OUT_S, () => {
+        try { prev.pause(); } catch(e){}
+        prev.currentTime = 0;
+      });
+
+      // swap
+      const tmp = ambActive;
+      ambActive = ambInactive;
+      ambInactive = tmp;
+
+      scheduleNextCrossfade();
+    }
+
+    function startAudioOnce(){
+      if (audioStarted) return;
+      audioStarted = true;
+      trackIndex = 0;
+
+      if (!ambActive) initAudio();
+
+      const first = playlist[trackIndex];
+      ambActive.src = first.src;
+      ambActive.currentTime = 0;
+      ambActive.volume = 0;
+
+      ambActive.play().catch(()=>{});
+      fadeAudioTo(ambActive, first.vol, FADE_IN_S);
+
+      scheduleNextCrossfade();
+    }
+
+    function pauseAudio(){
+      if (!ambActive) return;
+
+      clearXFadeTimeout();
+
+      // apaga ambos por si justo estaba crossfadeando
+      const a1 = ambActive;
+      const a2 = ambInactive;
+
+      fadeAudioTo(a1, 0, 0.6, () => { try { a1.pause(); } catch(e){} });
+      if (a2 && !a2.paused) {
+        fadeAudioTo(a2, 0, 0.6, () => { try { a2.pause(); } catch(e){} });
+      }
+    }
+
+    function resumeAudio(){
+      if (!ambActive) return;
+      if (!audioStarted) return;
+
+      ambActive.play().catch(()=>{});
+      const t = playlist[trackIndex];
+      fadeAudioTo(ambActive, t.vol, 0.6);
+
+      // por seguridad, apaga el inactivo si quedó vivo
+      if (ambInactive && !ambInactive.paused) {
+        fadeAudioTo(ambInactive, 0, 0.4, () => { try { ambInactive.pause(); } catch(e){} });
+      }
+
+      scheduleNextCrossfade();
+    }
+
+    // ===== DIALOGO SOBRE LA CABEZA (HTML overlay) =====
+    const speechEl = document.getElementById("speech");
+    let speechUntil = 0;
+    const _headPos = new THREE.Vector3();
+
+    function say(text, seconds = 2.6){
+      speechEl.textContent = text;
+      speechUntil = performance.now() + seconds * 1000;
+      speechEl.style.display = "block";
+    }
+
+    function updateSpeech(){
+      if (!playerRig || !speechEl) return;
+
+      if (speechEl.style.display !== "none" && performance.now() > speechUntil){
+        speechEl.style.display = "none";
+        return;
+      }
+      if (speechEl.style.display === "none") return;
+
+      // cabeza aproximada
+      playerRig.getWorldPosition(_headPos);
+      _headPos.y += 1.6;
+
+      const p = _headPos.clone().project(camera);
+      const x = (p.x * 0.5 + 0.5) * window.innerWidth;
+      const y = (-p.y * 0.5 + 0.5) * window.innerHeight;
+
+      speechEl.style.left = `${x}px`;
+      speechEl.style.top  = `${y}px`;
+    }
+
     // ===== GAME STATE =====
     let seen = false;
 
@@ -108,7 +358,7 @@
     document.getElementById("retryBtnWin").addEventListener("click", resetGame);
     document.getElementById("retryBtnLose").addEventListener("click", resetGame);
 
-    // ===== TIMER (2 min) =====
+    // ===== TIMER (1 min) =====
     const ROUND_TIME_MS = 60000;
     let timeLeftMs = ROUND_TIME_MS;
 
@@ -207,7 +457,7 @@
       });
 
       portalMesh = new THREE.Mesh(geom, portalMat);
-      portalMesh.position.set(-15, 0.8, -5); // <-- tu posición actual
+      portalMesh.position.set(-15, 0.8, -5);
       portalMesh.scale.set(0.8, 2, 1);
       portalMesh.rotation.y = Math.PI;
       scene.add(portalMesh);
@@ -294,96 +544,26 @@
     };
     let followPlayer = true;
 
-    function init(){
-      scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x111111);
-
-      camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 500);
-      camera.position.set(0, 12, 8);
-      camera.lookAt(0, 0, 0);
-
-      renderer = new THREE.WebGLRenderer({ antialias:true });
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      document.body.appendChild(renderer.domElement);
-
-      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-      const hemi = new THREE.HemisphereLight(0xffffff, 0x333333, 1.0);
-      hemi.position.set(0, 50, 0);
-      scene.add(hemi);
-      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
-      dir.position.set(15, 25, 10);
-      scene.add(dir);
-
-      // ===== Spot light principal =====
-      const spot = new THREE.SpotLight(0xffffff, 11.6);
-      spot.position.set(0, 5, 11);
-      spot.angle = Math.PI / 8;
-      spot.penumbra = 0.4;
-      spot.decay = 2;
-      spot.distance = 25;
-      spot.target.position.set(0, 0, 11);
-      scene.add(spot);
-      scene.add(spot.target);
-
-      // ===== Tone mapping =====
-      renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 0.8;
-
-      scene.add(new THREE.GridHelper(80, 80, 0x666666, 0x333333));
-      scene.add(new THREE.AxesHelper(3));
-
-      // ===== PORTAL =====
-      createPortal();
-
-      controls = new THREE.OrbitControls(camera, renderer.domElement);
-      controls.enableDamping = true;
-      controls.dampingFactor = 0.10;
-      controls.minDistance = CAM.minDist;
-      controls.maxDistance = CAM.maxDist;
-      controls.minPolarAngle = CAM.minPolar;
-      controls.maxPolarAngle = CAM.maxPolar;
-      controls.minAzimuthAngle = CAM.minAzimuth;
-      controls.maxAzimuthAngle = CAM.maxAzimuth;
-      controls.enablePan = true;
-      controls.screenSpacePanning = false;
-      controls.panSpeed = 0.7;
-
-      renderer.domElement.addEventListener("pointerdown", () => followPlayer = true);
-
-      window.addEventListener("keydown", (e) => {
-        const k = e.key.toLowerCase();
-
-        if (k === "c" && playerRig) {
-          const p = playerRig.position;
-          controls.target.set(p.x, p.y + CAM.targetHeight, p.z);
-          controls.update();
-        }
-
-        if (k === "e") extraKeys.e = true;
-        if (e.code === "Space") extraKeys.space = true;
-      });
-
-      window.addEventListener("keyup", (e) => {
-        const k = e.key.toLowerCase();
-        if (k === "e") extraKeys.e = false;
-        if (e.code === "Space") extraKeys.space = false;
-      });
-
-      clock = new THREE.Clock();
-
-      window.addEventListener("resize", onResize);
-      window.addEventListener("keydown", (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = true; });
-      window.addEventListener("keyup",   (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = false; });
-
-      loadGLB();
-      animate();
+    // ===== ANIMS helpers =====
+    function fadeTo(current, next){
+      if (!next || current === next) return current;
+      if (current) current.fadeOut(0.15);
+      next.reset().fadeIn(0.15).play();
+      return next;
+    }
+    function playPlayer(name){
+      const next = playerAnims[name];
+      if (!next) return;
+      playerCurrent = fadeTo(playerCurrent, next);
+    }
+    function playBoss(name){
+      const next = bossAnims[name];
+      if (!next) return;
+      bossCurrent = fadeTo(bossCurrent, next);
     }
 
     // ===== WIN/LOSE helpers =====
-    function hasAllMasks(){
-      return powers.kitsune && powers.oni && powers.chane;
-    }
+    function hasAllMasks(){ return powers.kitsune && powers.oni && powers.chane; }
 
     function checkPortalWin(){
       if (!portalMesh || !playerRig) return false;
@@ -403,11 +583,13 @@
     function winGame(){
       gameWon = true;
       winOverlay.style.display = "flex";
+      pauseAudio();
     }
 
     function loseGame(){
       gameLost = true;
       loseOverlay.style.display = "flex";
+      pauseAudio();
     }
 
     function resetGame(){
@@ -431,6 +613,10 @@
       BOSS.hp = 100;
       BOSS.alive = true;
 
+      // speech reset
+      speechEl.style.display = "none";
+      speechUntil = 0;
+
       // masks back
       if (maskKitsune) maskKitsune.visible = true;
       if (maskOni) maskOni.visible = true;
@@ -449,14 +635,35 @@
 
       // reset portal anim
       if (portalMat) portalMat.uniforms.time.value = 0;
-
-      // reset fov opacity
       if (fovMesh) fovMesh.material.opacity = FOV.opacity;
 
       setStatus("Retry...");
+
+      // audio
+      resumeAudio();
     }
 
-    // ===== FOV helpers =====
+    function loseByTime(){
+      timeLeftMs = 0;
+      setStatus("¡PERDISTE!");
+      loseGame();
+    }
+
+    function clampTargetToPlayer(){
+      if (!playerRig) return;
+      const p = playerRig.position;
+      const desired = new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z);
+
+      const offset = controls.target.clone().sub(desired);
+      offset.y = 0;
+
+      const max = CAM.maxTargetOffset;
+      if (offset.length() > max) offset.setLength(max);
+
+      controls.target.set(desired.x + offset.x, desired.y, desired.z + offset.z);
+    }
+
+    // ===== FOV mesh helpers =====
     function findHeadBone(obj){
       let found = null;
       obj.traverse((n) => {
@@ -510,11 +717,7 @@
       fovMesh.rotation.set(-Math.PI / 2, yaw - Math.PI/2, 0);
     }
 
-    // ===== COLISIONES helpers =====
-    function isCubePrefix(name){
-      return typeof name === "string" && name.startsWith("Cube");
-    }
-
+    // ===== COLLISION helpers =====
     function resizeBoxFromCenter(box, scaleX, scaleZ){
       const size = new THREE.Vector3();
       const center = new THREE.Vector3();
@@ -558,7 +761,7 @@
       rootObj.updateMatrixWorld(true);
 
       rootObj.traverse((o) => {
-        if (!o || !o.name || !isCubePrefix(o.name)) return;
+        if (!o || !o.name || !o.name.startsWith("Cube")) return;
         if (byUuid.has(o.uuid)) return;
         byUuid.add(o.uuid);
         nodes.push(o);
@@ -630,7 +833,7 @@
       }
     }
 
-    // ===== Line of sight (XZ): segmento vs AABB =====
+    // ===== LOS (XZ): segmento vs AABB =====
     function segmentIntersectsAABB2D(x0, z0, x1, z1, b){
       let t0 = 0, t1 = 1;
       const dx = x1 - x0;
@@ -669,17 +872,13 @@
       return false;
     }
 
-    // ===== WAYPOINTS helpers =====
-    function isWaypointName(name){
-      return typeof name === "string" && name.startsWith("WP_");
-    }
-
+    // ===== WAYPOINTS =====
     function collectWaypoints(rootObj){
       const list = [];
       rootObj.updateMatrixWorld(true);
 
       rootObj.traverse((o) => {
-        if (!o || !isWaypointName(o.name)) return;
+        if (!o || typeof o.name !== "string" || !o.name.startsWith("WP_")) return;
         const p = new THREE.Vector3();
         o.getWorldPosition(p);
         list.push({ name: o.name, pos: p });
@@ -715,7 +914,7 @@
       if (obstacles.length) resolveCircleVsAABB(bossRig.position, BOSS_RADIUS);
     }
 
-    // ===== MÁSCARAS =====
+    // ===== MASKS / POWERS =====
     function updatePickups(){
       if (!playerRig) return;
 
@@ -737,6 +936,16 @@
         if (d2 <= r*r) {
           mesh.visible = false;
           powers[keyName] = true;
+
+          // diálogo según máscara
+          if (keyName === "oni") {
+            say("Se te acaba de pudrir el queso, ortiva.", 2.6);
+          } else if (keyName === "kitsune") {
+            say("No existo. Nunca estuve acá.", 2.6);
+          } else if (keyName === "chane") {
+            say("Un gran poder conlleva una gran velocidad. O algo así.", 3.0);
+          }
+
           return true;
         }
         return false;
@@ -798,10 +1007,7 @@
             scene.remove(pr.mesh);
             projectiles.splice(i,1);
 
-            if (BOSS.hp <= 0) {
-              BOSS.alive = false;
-              setStatus("🔥 Vigilante derrotado");
-            }
+            if (BOSS.hp <= 0) BOSS.alive = false;
             continue;
           }
         }
@@ -813,28 +1019,6 @@
       }
     }
 
-    // ===== ANIMS helpers (faltaban) =====
-    function fadeTo(current, next){
-      if (!next || current === next) return current;
-      if (current) current.fadeOut(0.15);
-      next.reset().fadeIn(0.15).play();
-      return next;
-    }
-
-    function playPlayer(name){
-      const next = playerAnims[name];
-      if (!next) return;
-      playerCurrent = fadeTo(playerCurrent, next);
-    }
-
-    function playBoss(name){
-      const next = bossAnims[name];
-      if (!next) return;
-      bossCurrent = fadeTo(bossCurrent, next);
-    }
-
-
-
     function updateHUD(){
       const maskCount = (powers.kitsune?1:0) + (powers.oni?1:0) + (powers.chane?1:0);
       const invis = isInvisible() ? ` | Invis ${(Math.max(0, (powers.invisUntil - performance.now())/1000)).toFixed(1)}s` : "";
@@ -843,7 +1027,6 @@
       setDebug(`Máscaras ${maskCount}/3${invis}${boss}${t}`);
     }
 
-    // ===== LOAD GLB =====
     function loadGLB(){
       const loader = new THREE.GLTFLoader();
       loader.load("Game.glb", (gltf) => {
@@ -856,13 +1039,11 @@
         playerRig = root.getObjectByName("Armature");
         bossRig = root.getObjectByName("riggvigilante");
 
-        // máscaras (búsqueda flexible)
         maskKitsune = findByNameLoose(root, "kitsune");
         maskOni     = findByNameLoose(root, "oni");
         maskChane   = findByNameLoose(root, "chane");
 
         obstacles = buildObstaclesFromCubes(root);
-
         waypoints = collectWaypoints(root);
         wpIndex = 0;
 
@@ -908,34 +1089,123 @@
       });
     }
 
+    function init(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111111);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 500);
+      camera.position.set(0, 12, 8);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x333333, 1.0);
+      hemi.position.set(0, 50, 0);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(15, 25, 10);
+      scene.add(dir);
+
+      const spot = new THREE.SpotLight(0xffffff, 11.6);
+      spot.position.set(0, 5, 11);
+      spot.angle = Math.PI / 8;
+      spot.penumbra = 0.4;
+      spot.decay = 2;
+      spot.distance = 25;
+      spot.target.position.set(0, 0, 11);
+      scene.add(spot);
+      scene.add(spot.target);
+
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.8;
+
+      scene.add(new THREE.GridHelper(80, 80, 0x666666, 0x333333));
+      scene.add(new THREE.AxesHelper(3));
+
+      createPortal();
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.10;
+      controls.minDistance = CAM.minDist;
+      controls.maxDistance = CAM.maxDist;
+      controls.minPolarAngle = CAM.minPolar;
+      controls.maxPolarAngle = CAM.maxPolar;
+      controls.minAzimuthAngle = CAM.minAzimuth;
+      controls.maxAzimuthAngle = CAM.maxAzimuth;
+      controls.enablePan = true;
+      controls.screenSpacePanning = false;
+      controls.panSpeed = 0.7;
+
+      // AUDIO init
+      initAudio();
+
+      renderer.domElement.addEventListener("pointerdown", () => {
+        followPlayer = true;
+        startAudioOnce();
+      });
+
+      window.addEventListener("keydown", (e) => {
+        startAudioOnce();
+
+        const k = e.key.toLowerCase();
+
+        if (k === "c" && playerRig) {
+          const p = playerRig.position;
+          controls.target.set(p.x, p.y + CAM.targetHeight, p.z);
+          controls.update();
+        }
+
+        if (k === "e") extraKeys.e = true;
+        if (e.code === "Space") extraKeys.space = true;
+
+        if (k in keys) keys[k] = true;
+      });
+
+      window.addEventListener("keyup", (e) => {
+        const k = e.key.toLowerCase();
+        if (k === "e") extraKeys.e = false;
+        if (e.code === "Space") extraKeys.space = false;
+
+        if (k in keys) keys[k] = false;
+      });
+
+      clock = new THREE.Clock();
+      window.addEventListener("resize", onResize);
+
+      loadGLB();
+      animate();
+    }
+
     function update(dt){
-      // ===== Freeze si ganó o perdió =====
+      // freeze overlays
       if (gameWon || gameLost) {
         if (portalMat) portalMat.uniforms.time.value += dt;
         if (portalMesh) portalMesh.lookAt(camera.position);
         return;
       }
 
-      // ===== TIMER =====
-      timeLeftMs -= (dt * 1000);
-      if (timeLeftMs <= 0) {
-        timeLeftMs = 0;
-        loseGame();
-        setStatus("¡PERDISTE!");
-        updateHUD();
-        return;
-      }
+      // timer
+      timeLeftMs -= dt * 1000;
+      if (timeLeftMs <= 0) { loseByTime(); return; }
 
-      if (playerMixer) playerMixer.update(dt);
-      if (bossMixer) bossMixer.update(dt);
+      // anim portal
+      if (portalMat) portalMat.uniforms.time.value += dt;
       if (portalMesh) portalMesh.lookAt(camera.position);
 
-      if (portalMat) portalMat.uniforms.time.value += dt;
-
+      // kitsune / oni
       if (extraKeys.e) { extraKeys.e = false; useKitsune(); }
       if (extraKeys.space) shootFireball();
 
-      // PLAYER
+      // mixers
+      if (playerMixer) playerMixer.update(dt);
+      if (bossMixer) bossMixer.update(dt);
+
+      // player move
       if (playerRig) {
         const speedBase = 3.8;
         const speed = powers.chane ? speedBase * 1.45 : speedBase;
@@ -969,11 +1239,10 @@
       updatePickups();
       updateProjectiles(dt);
 
-      // BOSS patrulla
+      // boss patrol
       if (bossRig) {
         const before = bossRig.position.clone();
         updateBossPatrol(dt);
-
         const moved = before.distanceTo(bossRig.position) > 0.0005;
         if (moved && bossAnims["walk2"]) playBoss("walk2");
         else if (!moved && bossAnims["idle2"]) playBoss("idle2");
@@ -981,13 +1250,14 @@
 
       updateFOV();
 
-      // ===== WIN CHECK =====
+      // win
       if (checkPortalWin()) {
-        winGame();
         setStatus("🏁 ¡GANASTE! LOGRASTE ESCAPAR.");
+        winGame();
         return;
       }
 
+      // lose by detection
       if (!seen && isPlayerInFOV()) {
         seen = true;
         setStatus("🚨 ¡TE VIO! (tocaste el FOV rojo)");
@@ -995,6 +1265,9 @@
       } else if (!seen) {
         if (fovMesh) fovMesh.material.opacity = FOV.opacity;
       }
+
+      // dialog follow
+      updateSpeech();
 
       updateHUD();
     }
@@ -1011,21 +1284,6 @@
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
-    }
-
-    // ===== clampTargetToPlayer (se usa en update) =====
-    function clampTargetToPlayer(){
-      if (!playerRig) return;
-      const p = playerRig.position;
-      const desired = new THREE.Vector3(p.x, p.y + CAM.targetHeight, p.z);
-
-      const offset = controls.target.clone().sub(desired);
-      offset.y = 0;
-
-      const max = CAM.maxTargetOffset;
-      if (offset.length() > max) offset.setLength(max);
-
-      controls.target.set(desired.x + offset.x, desired.y, desired.z + offset.z);
     }
 
     init();

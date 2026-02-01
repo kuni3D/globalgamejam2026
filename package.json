@@ -1,6 +1,44 @@
 {
+  "name": "global-game-jam-2026",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "private": true,
+  "type": "commonjs",
+
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
     "three": "^0.182.0"
-  }
+  },
+
+  "devDependencies": {
+    "electron": "^40.1.0",
+    "electron-builder": "^26.4.0"
+  },
+
+  "build": {
+    "appId": "com.kuni3d.globalgamejam2026",
+    "productName": "Global Game Jam 2026",
+    "files": [
+      "**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  },
+
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kuni3D/globalgamejam2026.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kuni3D/globalgamejam2026/issues"
+  },
+  "homepage": "https://github.com/kuni3D/globalgamejam2026#readme",
+  "license": "ISC"
 }
