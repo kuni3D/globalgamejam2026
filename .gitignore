@@ -4,9 +4,6 @@ node_modules/
 # Electron build output
 dist/
 
-# Librerías locales (three offline)
-libs/
-
 # Logs
 npm-debug.log*
 yarn-debug.log*
